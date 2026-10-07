@@ -43,6 +43,7 @@ nyc_taxi_ingestion/
 ├── notebooks/ # Jupyter notebooks (ETL, EDA)
 ├── data/ # Raw data files (excluded from Git)
 ├── requirements.txt # Python dependencies
+├── pendo_tracking.py # Pendo Track Events sent by the ingestion steps
 ├── .gitignore # Excludes data/.env/state
 └── README.md # Project documentation
 
@@ -93,29 +94,99 @@ Username: taxi
 Password: taxi
 Database: nyc_taxi
 📥 Data Ingestion Steps
+Each step reports a Pendo Track Event with track_event() from pendo_tracking.py, so run the snippets from a notebook in the repo root (/home/jovyan/work in Jupyter).
+
+To send the events, set PENDO_TRACK_EVENT_SECRET (plus PENDO_DATA_HOST if your Pendo subscription is not on https://data.pendo.io) in your shell before docker compose up: export PENDO_TRACK_EVENT_SECRET=<secret> in bash, or $env:PENDO_TRACK_EVENT_SECRET = "<secret>" in PowerShell. Keep the secret out of notebooks and committed files. Without it the events are skipped and the steps run as before.
+
 Load Parquet → CSV (first 100K rows for testing):
 
 python
 Copy
 Edit
+import os
 import pandas as pd
-df = pd.read_parquet("yellow_tripdata_2023-01.parquet")
-df.head(100_000).to_csv("yellow_tripdata_2023-01.csv", index=False)
+from pendo_tracking import track_event
+
+# Settings for this run, shared by the steps below
+data_month = "2023-01"
+parquet_file = f"yellow_tripdata_{data_month}.parquet"
+csv_file = f"yellow_tripdata_{data_month}.csv"
+table_name = "yellow_taxi_data"
+
+df = pd.read_parquet(parquet_file)
+df_sample = df.head(100_000)
+df_sample.to_csv(csv_file, index=False)
+# Pendo: how much of the source month is kept in the CSV that gets loaded
+track_event("trip_parquet_converted_to_csv", {
+    "source_file": parquet_file,
+    "output_file": csv_file,
+    "source_row_count": len(df),
+    "rows_exported": len(df_sample),
+    "column_count": len(df.columns),
+    "data_month": data_month,
+    "output_file_size_bytes": os.path.getsize(csv_file),
+})
 Create Postgres schema:
 
 python
 Copy
 Edit
-df = pd.read_csv("yellow_tripdata_2023-01.csv")
-df.head(0).to_sql(name="yellow_taxi_data", con=engine, if_exists="replace", index=False)
+from sqlalchemy import inspect
+
+df = pd.read_csv(csv_file)
+# if_exists="replace" drops the table and every row loaded so far, so check first
+replaced_existing_table = inspect(engine).has_table(table_name)
+df.head(0).to_sql(name=table_name, con=engine, if_exists="replace", index=False)
+# Pendo: the only record of when the table was (re)created and whether data was wiped
+track_event("trip_table_schema_created", {
+    "table_name": table_name,
+    "if_exists": "replace",
+    "replaced_existing_table": replaced_existing_table,
+    "column_count": len(df.columns),
+    "column_names": ",".join(df.columns),
+    "source_file": csv_file,
+})
 Chunk and ingest data:
 
 python
 Copy
 Edit
+import time
+
 chunksize = 20000
-for chunk in pd.read_csv("yellow_tripdata_2023-01.csv", chunksize=chunksize):
-    chunk.to_sql(name="yellow_taxi_data", con=engine, if_exists="append", index=False)
+chunks_inserted = 0
+rows_ingested = 0
+start_time = time.perf_counter()
+try:
+    for chunk in pd.read_csv(csv_file, chunksize=chunksize):
+        chunk.to_sql(name=table_name, con=engine, if_exists="append", index=False)
+        chunks_inserted += 1
+        rows_ingested += len(chunk)
+except Exception as exc:
+    # Pendo: each chunk commits on its own, so record where the load stopped, then re-raise
+    track_event("trip_data_ingestion_failed", {
+        "source_file": csv_file,
+        "table_name": table_name,
+        "chunksize": chunksize,
+        "failed_chunk_number": chunks_inserted + 1,
+        "chunks_inserted_before_failure": chunks_inserted,
+        "rows_ingested_before_failure": rows_ingested,
+        "error_type": type(exc).__name__,
+        # pandas 3 wraps database errors and puts the SQL first, so report the cause
+        "error_message": str(exc.__cause__ or exc).split("\n", 1)[0][:150],
+    })
+    raise
+# Pendo: once per file, not per chunk
+track_event("trip_data_ingestion_completed", {
+    "source_file": csv_file,
+    "table_name": table_name,
+    "if_exists": "append",
+    "chunksize": chunksize,
+    "chunks_inserted": chunks_inserted,
+    "rows_ingested": rows_ingested,
+    "duration_seconds": round(time.perf_counter() - start_time, 2),
+    "data_month": data_month,
+})
 📊 Sample Questions to Explore
 What’s the average trip duration per hour?
 

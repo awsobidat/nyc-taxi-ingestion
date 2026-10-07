@@ -20,6 +20,11 @@ services:
       - .:/home/jovyan/work
     environment:
       JUPYTER_TOKEN: taxi
+      # TODO: export these on the host before `docker compose up` to send the
+      # Pendo Track Events in pendo_tracking.py (the secret is required; the
+      # data host defaults to https://data.pendo.io). Never commit the secret.
+      PENDO_TRACK_EVENT_SECRET:
+      PENDO_DATA_HOST:
     depends_on:
       - postgres
 
